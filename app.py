@@ -1,477 +1,856 @@
-from flask import Flask, render_template, jsonify
-import requests
-import time
-from collections import Counter, defaultdict
-import math
-
-app = Flask(__name__)
-
-API_BASE = "https://draw.ar-lottery01.com"
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
-    'Origin': 'https://dkwin9.com',
-    'Referer': 'https://dkwin9.com/',
-    'Sec-Fetch-Dest': 'empty',
-    'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Site': 'cross-site'
-}
-
-NUMBER_TO_COLOR = {
-    0: ['Red', 'Violet'],
-    1: ['Green'],
-    2: ['Red'],
-    3: ['Green'],
-    4: ['Red'],
-    5: ['Green', 'Violet'],
-    6: ['Red'],
-    7: ['Green'],
-    8: ['Red'],
-    9: ['Green']
-}
-
-def get_color_list(color_string):
-    colors = []
-    if 'green' in color_string.lower():
-        colors.append('Green')
-    if 'red' in color_string.lower():
-        colors.append('Red')
-    if 'violet' in color_string.lower():
-        colors.append('Violet')
-    return colors if colors else ['Unknown']
-
-def get_big_small(number):
-    return 'Big' if int(number) >= 5 else 'Small'
-
-def get_number_color(number):
-    return NUMBER_TO_COLOR.get(int(number), ['Unknown'])
-
-
-class PredictionEngine:
-    def __init__(self, history):
-        self.history = history
-        self.numbers = [int(h['number']) for h in history if h.get('number', '') != '']
-        self.big_small_list = [h['big_small'] for h in history if h.get('big_small')]
-        
-    def analyze_frequency(self, window=50):
-        if len(self.numbers) < 5:
-            return {i: 0.1 for i in range(10)}
-        
-        recent = self.numbers[:min(window, len(self.numbers))]
-        counts = Counter(recent)
-        total = len(recent)
-        
-        freq = {}
-        for i in range(10):
-            freq[i] = counts.get(i, 0) / total if total > 0 else 0.1
-        return freq
-    
-    def analyze_hot_cold(self, hot_window=10, cold_window=50):
-        if len(self.numbers) < hot_window:
-            return {i: 0.5 for i in range(10)}
-        
-        hot_counts = Counter(self.numbers[:hot_window])
-        cold_counts = Counter(self.numbers[:min(cold_window, len(self.numbers))])
-        
-        scores = {}
-        for i in range(10):
-            hot_freq = hot_counts.get(i, 0) / hot_window
-            cold_freq = cold_counts.get(i, 0) / min(cold_window, len(self.numbers))
-            
-            if hot_freq > cold_freq * 1.5:
-                scores[i] = 0.7
-            elif hot_freq < cold_freq * 0.5:
-                scores[i] = 0.6
-            else:
-                scores[i] = 0.5
-        return scores
-    
-    def analyze_streaks(self):
-        if len(self.big_small_list) < 3:
-            return {'predicted': None, 'strength': 0}
-        
-        streak_count = 1
-        streak_value = self.big_small_list[0]
-        
-        for i in range(1, min(10, len(self.big_small_list))):
-            if self.big_small_list[i] == streak_value:
-                streak_count += 1
-            else:
-                break
-        
-        if streak_count >= 4:
-            return {
-                'predicted': 'Small' if streak_value == 'Big' else 'Big',
-                'strength': min(0.85, 0.6 + streak_count * 0.05)
-            }
-        elif streak_count >= 3:
-            return {
-                'predicted': 'Small' if streak_value == 'Big' else 'Big',
-                'strength': 0.7
-            }
-        
-        return {'predicted': None, 'strength': 0}
-    
-    def analyze_transitions(self):
-        if len(self.numbers) < 10:
-            return {i: {j: 0.1 for j in range(10)} for i in range(10)}
-        
-        transitions = defaultdict(lambda: defaultdict(int))
-        for i in range(len(self.numbers) - 1):
-            prev_number = self.numbers[i + 1]
-            curr_number = self.numbers[i]
-            transitions[prev_number][curr_number] += 1
-        
-        trans_prob = {}
-        for i in range(10):
-            total = sum(transitions[i].values())
-            trans_prob[i] = {}
-            for j in range(10):
-                trans_prob[i][j] = transitions[i][j] / total if total > 0 else 0.1
-        
-        return trans_prob
-    
-    def analyze_alternating_pattern(self):
-        if len(self.big_small_list) < 6:
-            return {'is_alternating': False, 'next': None, 'strength': 0}
-        
-        recent = self.big_small_list[:6]
-        alternating_count = 0
-        for i in range(len(recent) - 1):
-            if recent[i] != recent[i + 1]:
-                alternating_count += 1
-        
-        if alternating_count >= 4:
-            next_val = 'Small' if recent[0] == 'Big' else 'Big'
-            return {
-                'is_alternating': True,
-                'next': next_val,
-                'strength': 0.65 + (alternating_count - 4) * 0.05
-            }
-        
-        return {'is_alternating': False, 'next': None, 'strength': 0}
-    
-    def analyze_color_patterns(self):
-        if len(self.history) < 10:
-            return {'Green': 0.5, 'Red': 0.5, 'Violet': 0.2, 'streak': None}
-        
-        color_counts = {'Green': 0, 'Red': 0, 'Violet': 0}
-        total = 0
-        
-        for h in self.history[:50]:
-            colors = h.get('colors', [])
-            for c in colors:
-                if c in color_counts:
-                    color_counts[c] += 1
-            total += 1
-        
-        recent_primary_colors = []
-        for h in self.history[:10]:
-            colors = h.get('colors', [])
-            if colors:
-                primary = 'Green' if 'Green' in colors else 'Red'
-                recent_primary_colors.append(primary)
-        
-        color_streak = None
-        if len(recent_primary_colors) >= 4:
-            if all(c == 'Green' for c in recent_primary_colors[:4]):
-                color_streak = 'Red'
-            elif all(c == 'Red' for c in recent_primary_colors[:4]):
-                color_streak = 'Green'
-        
-        freqs = {k: v / total if total > 0 else 0.33 for k, v in color_counts.items()}
-        return {
-            'frequencies': freqs,
-            'streak': color_streak
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WinGo 30S Prediction Engine</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        /* Define custom colors and fonts */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        :root {
+            font-family: 'Inter', sans-serif;
         }
-    
-    def analyze_gap_pattern(self):
-        if len(self.numbers) < 20:
-            return {i: 0 for i in range(10)}
-        
-        last_seen = {}
-        for idx, num in enumerate(self.numbers):
-            if num not in last_seen:
-                last_seen[num] = idx
-        
-        gap_scores = {}
-        for i in range(10):
-            gap = last_seen.get(i, 20)
-            if gap >= 15:
-                gap_scores[i] = 0.8
-            elif gap >= 10:
-                gap_scores[i] = 0.7
-            elif gap >= 7:
-                gap_scores[i] = 0.6
-            else:
-                gap_scores[i] = 0.3
-        
-        return gap_scores
-    
-    def calculate_number_probabilities(self):
-        if len(self.numbers) < 5:
-            return {i: 0.1 for i in range(10)}
-        
-        freq_scores = self.analyze_frequency()
-        hot_cold_scores = self.analyze_hot_cold()
-        gap_scores = self.analyze_gap_pattern()
-        trans_probs = self.analyze_transitions()
-        
-        last_number = self.numbers[0] if self.numbers else 0
-        trans_scores = trans_probs.get(last_number, {i: 0.1 for i in range(10)})
-        
-        combined = {}
-        for i in range(10):
-            score = (
-                freq_scores.get(i, 0.1) * 0.15 +
-                hot_cold_scores.get(i, 0.5) * 0.25 +
-                gap_scores.get(i, 0.5) * 0.35 +
-                trans_scores.get(i, 0.1) * 0.25
-            )
-            combined[i] = score
-        
-        total = sum(combined.values())
-        if total > 0:
-            combined = {k: v / total for k, v in combined.items()}
-        
-        return combined
-    
-    def predict(self):
-        if len(self.numbers) < 5:
-            import random
-            num = random.randint(0, 9)
-            return {
-                'number': num,
-                'big_small': get_big_small(num),
-                'colors': get_number_color(num),
-                'confidence': 50,
-                'analysis': {
-                    'method': 'random',
-                    'reason': 'Insufficient data for analysis'
+    </style>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'primary-green': '#10b981',
+                        'primary-red': '#ef4444',
+                        'primary-violet': '#8b5cf6',
+                        'primary-bg': '#f9fafb',
+                    }
                 }
             }
-        
-        streak_analysis = self.analyze_streaks()
-        alternating_analysis = self.analyze_alternating_pattern()
-        color_analysis = self.analyze_color_patterns()
-        number_probs = self.calculate_number_probabilities()
-        
-        predicted_big_small = None
-        big_small_confidence = 0
-        analysis_method = []
-        preferred_color = None
-        
-        if color_analysis['streak']:
-            preferred_color = color_analysis['streak']
-            analysis_method.append(f"Color streak detected - expect {preferred_color}")
-        
-        if streak_analysis['strength'] > 0.6:
-            predicted_big_small = streak_analysis['predicted']
-            big_small_confidence = streak_analysis['strength']
-            analysis_method.append(f"Streak reversal detected")
-        
-        if alternating_analysis['is_alternating'] and alternating_analysis['strength'] > big_small_confidence:
-            predicted_big_small = alternating_analysis['next']
-            big_small_confidence = alternating_analysis['strength']
-            analysis_method.append(f"Alternating pattern detected")
-        
-        if predicted_big_small is None:
-            big_count = self.big_small_list[:20].count('Big')
-            small_count = self.big_small_list[:20].count('Small')
-            
-            if big_count > small_count + 2:
-                predicted_big_small = 'Small'
-                big_small_confidence = 0.6
-                analysis_method.append("Big/Small imbalance - expect Small")
-            elif small_count > big_count + 2:
-                predicted_big_small = 'Big'
-                big_small_confidence = 0.6
-                analysis_method.append("Big/Small imbalance - expect Big")
-            else:
-                predicted_big_small = 'Small' if big_count >= small_count else 'Big'
-                big_small_confidence = 0.55
-                analysis_method.append("Statistical balance prediction")
-        
-        if predicted_big_small == 'Big':
-            filtered_probs = {k: v for k, v in number_probs.items() if k >= 5}
-        else:
-            filtered_probs = {k: v for k, v in number_probs.items() if k < 5}
-        
-        if not filtered_probs:
-            filtered_probs = number_probs
-        
-        green_numbers = [1, 3, 5, 7, 9]
-        red_numbers = [0, 2, 4, 6, 8]
-        
-        color_freqs = color_analysis.get('frequencies', {})
-        green_freq = color_freqs.get('Green', 0.5)
-        red_freq = color_freqs.get('Red', 0.5)
-        
-        if preferred_color:
-            if preferred_color == 'Green':
-                for k in filtered_probs:
-                    if k in green_numbers:
-                        filtered_probs[k] *= 1.4
-                    else:
-                        filtered_probs[k] *= 0.6
-            elif preferred_color == 'Red':
-                for k in filtered_probs:
-                    if k in red_numbers:
-                        filtered_probs[k] *= 1.4
-                    else:
-                        filtered_probs[k] *= 0.6
-        else:
-            color_bias = green_freq - red_freq
-            if abs(color_bias) > 0.1:
-                for k in filtered_probs:
-                    if color_bias > 0 and k in red_numbers:
-                        filtered_probs[k] *= 1.15
-                    elif color_bias < 0 and k in green_numbers:
-                        filtered_probs[k] *= 1.15
-        
-        total_prob = sum(filtered_probs.values())
-        if total_prob > 0:
-            filtered_probs = {k: v / total_prob for k, v in filtered_probs.items()}
-        
-        sorted_candidates = sorted(filtered_probs.items(), key=lambda x: x[1], reverse=True)
-        
-        top_number = sorted_candidates[0][0]
-        top_prob = sorted_candidates[0][1]
-        
-        second_prob = sorted_candidates[1][1] if len(sorted_candidates) > 1 else 0
-        prob_gap = top_prob - second_prob
-        
-        number_confidence = min(0.9, 0.5 + prob_gap * 3 + top_prob * 0.2)
-        
-        overall_confidence = int((big_small_confidence * 0.4 + number_confidence * 0.6) * 100)
-        overall_confidence = max(55, min(95, overall_confidence))
-        
-        predicted_colors = get_number_color(top_number)
-        
-        return {
-            'number': top_number,
-            'big_small': predicted_big_small,
-            'colors': predicted_colors,
-            'confidence': overall_confidence,
-            'analysis': {
-                'method': ' | '.join(analysis_method) if analysis_method else 'Statistical analysis',
-                'top_candidates': [{'number': n, 'score': round(s * 100, 1)} for n, s in sorted_candidates[:3]],
-                'streak_info': f"Last {self.big_small_list[:5]}" if len(self.big_small_list) >= 5 else "Limited data"
+        }
+    </script>
+</head>
+<body class="bg-gray-100 min-h-screen p-2 sm:p-4">
+
+    <div id="app" class="max-w-4xl mx-auto">
+        <header class="bg-white shadow-lg rounded-xl p-4 mb-4">
+            <h1 class="text-3xl font-extrabold text-gray-800 flex items-center">
+                <i data-lucide="gem" class="w-8 h-8 text-primary-green mr-2"></i>
+                WinGo 30S Predictor
+            </h1>
+            <p class="text-sm text-gray-500 mt-1">Advanced Pattern Analysis for Next Period</p>
+        </header>
+
+        <!-- Current Period & Countdown Section -->
+        <section id="current-period-section" class="mb-6 grid grid-cols-1 md:grid-cols-3 gap-4">
+            <!-- Prediction Card -->
+            <div id="prediction-card" class="md:col-span-2 bg-white p-6 rounded-xl shadow-lg border-t-4 border-primary-green transition-all duration-300">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-xl font-bold text-gray-700">Next Predicted Result</h2>
+                    <span id="prediction-confidence" class="px-3 py-1 text-sm font-semibold rounded-full bg-primary-green text-white shadow-md"></span>
+                </div>
+                
+                <div class="flex flex-col sm:flex-row items-center justify-between space-y-4 sm:space-y-0 sm:space-x-4">
+                    <!-- Predicted Number -->
+                    <div class="flex flex-col items-center w-full sm:w-auto">
+                        <span class="text-xs font-medium text-gray-500 uppercase">Number</span>
+                        <div id="predicted-number" class="text-6xl font-black mt-1 p-4 rounded-xl text-white shadow-2xl transition-transform duration-500 transform hover:scale-105" style="background-color: #374151;">?</div>
+                    </div>
+
+                    <!-- Predicted Big/Small & Color -->
+                    <div class="flex flex-col space-y-3 w-full sm:w-auto">
+                        <div class="bg-gray-50 p-3 rounded-lg flex justify-between items-center shadow-inner">
+                            <span class="text-sm font-medium text-gray-500 flex items-center"><i data-lucide="scale" class="w-4 h-4 mr-2"></i> Big/Small:</span>
+                            <span id="predicted-big-small" class="text-lg font-bold text-gray-800">...</span>
+                        </div>
+                        <div class="bg-gray-50 p-3 rounded-lg flex justify-between items-center shadow-inner">
+                            <span class="text-sm font-medium text-gray-500 flex items-center"><i data-lucide="paintbrush" class="w-4 h-4 mr-2"></i> Color:</span>
+                            <div id="predicted-colors" class="text-lg font-bold flex space-x-1"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="mt-4 pt-4 border-t border-gray-100">
+                    <p class="text-xs text-gray-500 italic" id="analysis-reason">Loading prediction analysis...</p>
+                </div>
+            </div>
+
+            <!-- Countdown Card -->
+            <div class="bg-white p-6 rounded-xl shadow-lg flex flex-col justify-between">
+                <h2 class="text-xl font-bold text-gray-700 flex items-center"><i data-lucide="clock" class="w-5 h-5 mr-2 text-blue-500"></i> Next Draw</h2>
+                <div class="flex flex-col items-center my-4">
+                    <span id="next-issue-number" class="text-sm font-mono text-gray-500 bg-gray-100 px-3 py-1 rounded-full mb-2">#00000000</span>
+                    <div id="countdown-timer" class="text-7xl font-extrabold text-red-600 animate-pulse">00</div>
+                    <span class="text-xs font-medium text-gray-500 uppercase mt-1">Seconds Left</span>
+                </div>
+                <div class="bg-blue-50 p-3 rounded-lg">
+                    <p class="text-sm text-blue-800">Data last updated <span id="last-updated" class="font-semibold">...</span></p>
+                </div>
+            </div>
+        </section>
+
+        <!-- History Table Section -->
+        <section class="bg-white p-4 rounded-xl shadow-lg mb-6">
+            <h2 class="text-xl font-bold text-gray-700 mb-4 flex items-center"><i data-lucide="list-ordered" class="w-5 h-5 mr-2 text-gray-600"></i> Recent History (Top 20)</h2>
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Period</th>
+                            <th class="px-4 py-2 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Result</th>
+                            <th class="px-4 py-2 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Big/Small</th>
+                            <th class="px-4 py-2 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Colors</th>
+                        </tr>
+                    </thead>
+                    <tbody id="history-table-body" class="bg-white divide-y divide-gray-200">
+                        <!-- History rows will be injected here -->
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </div>
+
+    <script>
+        // --- CONSTANTS ---
+        const API_BASE = "https://draw.ar-lottery01.com";
+        const API_VERSION = "WinGo/WinGo_30S"; // Base path for 30S game
+        const UPDATE_INTERVAL = 1000; // 1 second update
+        const DATA_REFRESH_INTERVAL = 15000; // 15 seconds data refresh
+
+        const NUMBER_TO_COLOR = {
+            0: ['primary-red', 'primary-violet'], // Red, Violet
+            1: ['primary-green'], // Green
+            2: ['primary-red'], // Red
+            3: ['primary-green'], // Green
+            4: ['primary-red'], // Red
+            5: ['primary-green', 'primary-violet'], // Green, Violet
+            6: ['primary-red'], // Red
+            7: ['primary-green'], // Green
+            8: ['primary-red'], // Red
+            9: ['primary-green'] // Green
+        };
+
+        // --- HELPER FUNCTIONS ---
+
+        /**
+         * @param {number} number
+         * @returns {'Big' | 'Small'}
+         */
+        function getBigSmall(number) {
+            return number >= 5 ? 'Big' : 'Small';
+        }
+
+        /**
+         * @param {number} number
+         * @returns {string[]} Tailwind color class names
+         */
+        function getNumberColorClasses(number) {
+            return NUMBER_TO_COLOR[number] || ['bg-gray-500'];
+        }
+
+        /**
+         * Converts API color strings to internal format (and handles unknown)
+         * @param {string} colorString
+         * @returns {string[]}
+         */
+        function getColorList(colorString) {
+            const colors = [];
+            if (colorString.toLowerCase().includes('green')) colors.push('Green');
+            if (colorString.toLowerCase().includes('red')) colors.push('Red');
+            if (colorString.toLowerCase().includes('violet')) colors.push('Violet');
+            return colors.length ? colors : ['Unknown'];
+        }
+
+        /**
+         * Helper to safely make API calls with retries
+         * @param {string} url
+         * @param {number} retries
+         * @returns {Promise<any>}
+         */
+        async function fetchWithRetry(url, retries = 3) {
+            const headers = {
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36',
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8'
+            };
+
+            for (let i = 0; i < retries; i++) {
+                try {
+                    const response = await fetch(url, { headers, timeout: 5000 });
+                    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                    return await response.json();
+                } catch (error) {
+                    console.error(`Fetch attempt ${i + 1} failed for ${url}:`, error);
+                    if (i === retries - 1) throw error;
+                    await new Promise(resolve => setTimeout(resolve, Math.pow(2, i) * 1000)); // Exponential backoff
+                }
             }
         }
 
 
-def generate_prediction(history):
-    engine = PredictionEngine(history)
-    return engine.predict()
+        // --- DATA FETCHING ---
 
+        let currentPeriodData = {
+            issueNumber: '00000000',
+            leftTime: 0,
+            previous: null,
+            next: null
+        };
 
-def fetch_current_period():
-    try:
-        ts = int(time.time() * 1000)
-        url = f"{API_BASE}/WinGo/WinGo_30S.json?ts={ts}"
-        response = requests.get(url, headers=HEADERS, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            current = data.get('current', {})
-            end_time = current.get('endTime', 0)
-            current_time = int(time.time() * 1000)
-            left_time = max(0, (end_time - current_time) // 1000)
-            
-            return {
-                'issueNumber': current.get('issueNumber', ''),
-                'leftTime': left_time,
-                'previous': data.get('previous', {}),
-                'next': data.get('next', {})
+        let historyCache = {
+            data: [],
+            timestamp: 0
+        };
+
+        async function fetchCurrentPeriod() {
+            try {
+                const ts = Date.now();
+                const url = `${API_BASE}/${API_VERSION}.json?ts=${ts}`;
+                const data = await fetchWithRetry(url);
+
+                const current = data.current || {};
+                const endTime = current.endTime || 0;
+                const currentTime = Date.now();
+                const leftTime = Math.max(0, Math.floor((endTime - currentTime) / 1000));
+
+                currentPeriodData = {
+                    issueNumber: current.issueNumber || '00000000',
+                    leftTime: leftTime,
+                    previous: data.previous || null,
+                    next: data.next || null
+                };
+
+            } catch (e) {
+                console.error("Failed to fetch current period:", e);
+                // Keep the old data but reset the timer to ensure refresh
+                currentPeriodData.leftTime = 0; 
             }
-    except Exception as e:
-        print(f"Error fetching current period: {e}")
-    return None
+        }
 
+        async function fetchHistory() {
+            const currentTime = Date.now();
 
-history_cache = {
-    'data': [],
-    'timestamp': 0
-}
+            if (historyCache.data.length > 0 && (currentTime - historyCache.timestamp) < DATA_REFRESH_INTERVAL) {
+                return historyCache.data;
+            }
 
-def fetch_history_page(page=1):
-    try:
-        ts = int(time.time() * 1000)
-        url = f"{API_BASE}/WinGo/WinGo_30S/GetHistoryIssuePage.json?ts={ts}&pageNo={page}&pageSize=50"
-        response = requests.get(url, headers=HEADERS, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            results = []
+            let allResults = [];
+            // Fetch multiple pages for better statistical analysis
+            for (let page = 1; page <= 5; page++) {
+                try {
+                    const ts = Date.now();
+                    const url = `${API_BASE}/${API_VERSION}/GetHistoryIssuePage.json?ts=${ts}&pageNo=${page}&pageSize=50`;
+                    const data = await fetchWithRetry(url);
+
+                    const historyList = data?.data?.list || [];
+                    const pageResults = historyList
+                        .filter(item => item.number !== null && item.number !== '')
+                        .map(item => ({
+                            period: item.issueNumber,
+                            number: parseInt(item.number, 10),
+                            big_small: getBigSmall(parseInt(item.number, 10)),
+                            colors: getColorList(item.color)
+                        }));
+
+                    if (pageResults.length === 0) break;
+                    allResults.push(...pageResults);
+
+                } catch (e) {
+                    console.error(`Failed to fetch history page ${page}:`, e);
+                    break;
+                }
+            }
+
+            // Deduplicate and sort
+            const seenPeriods = new Set();
+            const uniqueResults = allResults.filter(item => {
+                if (seenPeriods.has(item.period)) return false;
+                seenPeriods.add(item.period);
+                return true;
+            }).sort((a, b) => b.period - a.period); // Sort descending by period number
+
+            if (uniqueResults.length > 0) {
+                historyCache.data = uniqueResults;
+                historyCache.timestamp = currentTime;
+            }
             
-            if isinstance(data, dict) and 'data' in data:
-                history_list = data.get('data', {}).get('list', [])
-                for item in history_list:
-                    period = item.get('issueNumber', '')
-                    number = item.get('number', '')
-                    color = item.get('color', '')
-                    if number != '':
-                        results.append({
-                            'period': period,
-                            'number': number,
-                            'big_small': get_big_small(number),
-                            'colors': get_color_list(color)
-                        })
-            return results
-    except Exception as e:
-        print(f"Error fetching history page {page}: {e}")
-    return []
-
-def fetch_history():
-    global history_cache
-    current_time = int(time.time())
-    
-    if history_cache['data'] and (current_time - history_cache['timestamp']) < 30:
-        return history_cache['data']
-    
-    all_results = []
-    
-    for page in range(1, 5):
-        page_results = fetch_history_page(page)
-        if not page_results:
-            break
-        all_results.extend(page_results)
-        if len(page_results) < 50:
-            break
-    
-    seen_periods = set()
-    unique_results = []
-    for item in all_results:
-        if item['period'] not in seen_periods:
-            seen_periods.add(item['period'])
-            unique_results.append(item)
-    
-    unique_results.sort(key=lambda x: x['period'], reverse=True)
-    
-    if unique_results:
-        history_cache['data'] = unique_results
-        history_cache['timestamp'] = current_time
-    
-    return unique_results if unique_results else history_cache['data']
+            return historyCache.data;
+        }
 
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+        // --- PREDICTION LOGIC (JS Class Translation of Python) ---
+
+        class PredictionEngine {
+            /**
+             * @param {Array<Object>} history - Array of historical draw objects
+             */
+            constructor(history) {
+                this.history = history;
+                this.numbers = history.map(h => h.number).filter(n => typeof n === 'number');
+                this.bigSmallList = history.map(h => h.big_small).filter(bs => bs);
+            }
+
+            analyzeFrequency(window = 50) {
+                if (this.numbers.length < 5) {
+                    return Array.from({ length: 10 }, (_, i) => ({ number: i, score: 0.1 }));
+                }
+
+                const recent = this.numbers.slice(0, Math.min(window, this.numbers.length));
+                const counts = {};
+                recent.forEach(n => counts[n] = (counts[n] || 0) + 1);
+                const total = recent.length;
+
+                const freq = {};
+                for (let i = 0; i < 10; i++) {
+                    freq[i] = (counts[i] || 0) / total || 0.1;
+                }
+                return freq;
+            }
+
+            analyzeHotCold(hotWindow = 10, coldWindow = 50) {
+                if (this.numbers.length < hotWindow) {
+                    return Array.from({ length: 10 }, (_, i) => ({ number: i, score: 0.5 }));
+                }
+
+                const hotCounts = {};
+                this.numbers.slice(0, hotWindow).forEach(n => hotCounts[n] = (hotCounts[n] || 0) + 1);
+
+                const coldCounts = {};
+                const coldData = this.numbers.slice(0, Math.min(coldWindow, this.numbers.length));
+                coldData.forEach(n => coldCounts[n] = (coldCounts[n] || 0) + 1);
+
+                const scores = {};
+                for (let i = 0; i < 10; i++) {
+                    const hotFreq = (hotCounts[i] || 0) / hotWindow;
+                    const coldFreq = (coldCounts[i] || 0) / coldData.length;
+
+                    if (hotFreq > coldFreq * 1.5) {
+                        scores[i] = 0.7; // Hot
+                    } else if (hotFreq < coldFreq * 0.5) {
+                        scores[i] = 0.6; // Cold (due for a hit)
+                    } else {
+                        scores[i] = 0.5; // Neutral
+                    }
+                }
+                return scores;
+            }
+
+            analyzeStreaks() {
+                if (this.bigSmallList.length < 3) {
+                    return { predicted: null, strength: 0 };
+                }
+
+                let streakCount = 1;
+                const streakValue = this.bigSmallList[0];
+
+                for (let i = 1; i < Math.min(10, this.bigSmallList.length); i++) {
+                    if (this.bigSmallList[i] === streakValue) {
+                        streakCount++;
+                    } else {
+                        break;
+                    }
+                }
+
+                if (streakCount >= 4) {
+                    return {
+                        predicted: streakValue === 'Big' ? 'Small' : 'Big',
+                        strength: Math.min(0.85, 0.6 + streakCount * 0.05)
+                    };
+                } else if (streakCount >= 3) {
+                    return {
+                        predicted: streakValue === 'Big' ? 'Small' : 'Big',
+                        strength: 0.7
+                    };
+                }
+
+                return { predicted: null, strength: 0 };
+            }
+
+            analyzeTransitions() {
+                if (this.numbers.length < 10) {
+                    return {};
+                }
+
+                const transitions = {};
+                for (let i = 0; i < 10; i++) { transitions[i] = {}; for (let j = 0; j < 10; j++) transitions[i][j] = 0; }
+
+                for (let i = 0; i < this.numbers.length - 1; i++) {
+                    const prevNumber = this.numbers[i + 1];
+                    const currNumber = this.numbers[i];
+                    transitions[prevNumber][currNumber] = (transitions[prevNumber][currNumber] || 0) + 1;
+                }
+
+                const transProb = {};
+                for (let i = 0; i < 10; i++) {
+                    const total = Object.values(transitions[i]).reduce((sum, count) => sum + count, 0);
+                    transProb[i] = {};
+                    for (let j = 0; j < 10; j++) {
+                        transProb[i][j] = (transitions[i][j] || 0) / total || 0.1;
+                    }
+                }
+
+                return transProb;
+            }
+
+            analyzeAlternatingPattern() {
+                if (this.bigSmallList.length < 6) {
+                    return { isAlternating: false, next: null, strength: 0 };
+                }
+
+                const recent = this.bigSmallList.slice(0, 6);
+                let alternatingCount = 0;
+                for (let i = 0; i < recent.length - 1; i++) {
+                    if (recent[i] !== recent[i + 1]) {
+                        alternatingCount++;
+                    }
+                }
+
+                if (alternatingCount >= 4) {
+                    const nextVal = recent[0] === 'Big' ? 'Small' : 'Big';
+                    return {
+                        isAlternating: true,
+                        next: nextVal,
+                        strength: 0.65 + (alternatingCount - 4) * 0.05
+                    };
+                }
+
+                return { isAlternating: false, next: null, strength: 0 };
+            }
+
+            analyzeColorPatterns() {
+                if (this.history.length < 10) {
+                    return { frequencies: { Green: 0.5, Red: 0.5, Violet: 0.2 }, streak: null };
+                }
+
+                const colorCounts = { Green: 0, Red: 0, Violet: 0 };
+                let total = 0;
+
+                this.history.slice(0, 50).forEach(h => {
+                    h.colors.forEach(c => {
+                        if (c in colorCounts) colorCounts[c]++;
+                    });
+                    total++;
+                });
+
+                const recentPrimaryColors = this.history.slice(0, 10)
+                    .map(h => {
+                        if (h.colors.includes('Green')) return 'Green';
+                        if (h.colors.includes('Red')) return 'Red';
+                        return null;
+                    })
+                    .filter(c => c !== null);
+
+                let colorStreak = null;
+                if (recentPrimaryColors.length >= 4) {
+                    if (recentPrimaryColors.slice(0, 4).every(c => c === 'Green')) {
+                        colorStreak = 'Red'; // Predict reversal
+                    } else if (recentPrimaryColors.slice(0, 4).every(c => c === 'Red')) {
+                        colorStreak = 'Green'; // Predict reversal
+                    }
+                }
+
+                const freqs = {
+                    Green: (colorCounts.Green / total) || 0.33,
+                    Red: (colorCounts.Red / total) || 0.33,
+                    Violet: (colorCounts.Violet / total) || 0.05,
+                };
+
+                return { frequencies: freqs, streak: colorStreak };
+            }
+
+            analyzeGapPattern() {
+                if (this.numbers.length < 20) {
+                    return Array.from({ length: 10 }, (_, i) => ({ number: i, score: 0.5 }));
+                }
+
+                const lastSeen = {};
+                this.numbers.forEach((num, idx) => {
+                    if (!(num in lastSeen)) lastSeen[num] = idx;
+                });
+
+                const gapScores = {};
+                for (let i = 0; i < 10; i++) {
+                    const gap = lastSeen[i] === undefined ? 20 : lastSeen[i];
+                    if (gap >= 15) {
+                        gapScores[i] = 0.8; // Very cold, high probability to appear
+                    } else if (gap >= 10) {
+                        gapScores[i] = 0.7;
+                    } else if (gap >= 7) {
+                        gapScores[i] = 0.6;
+                    } else {
+                        gapScores[i] = 0.3; // Very hot, low probability to appear
+                    }
+                }
+
+                return gapScores;
+            }
+
+            calculateNumberProbabilities() {
+                if (this.numbers.length < 5) {
+                    const randomProbs = {};
+                    for(let i=0; i<10; i++) randomProbs[i] = 0.1;
+                    return randomProbs;
+                }
+
+                const freqScores = this.analyzeFrequency();
+                const hotColdScores = this.analyzeHotCold();
+                const gapScores = this.analyzeGapPattern();
+                const transProbs = this.analyzeTransitions();
+
+                const lastNumber = this.numbers[0] || 0;
+                const transScores = transProbs[lastNumber] || Array.from({ length: 10 }, (_, i) => ({ number: i, score: 0.1 }));
+
+                let combined = {};
+                for (let i = 0; i < 10; i++) {
+                    const score = (
+                        (freqScores[i] || 0.1) * 0.15 +
+                        (hotColdScores[i] || 0.5) * 0.25 +
+                        (gapScores[i] || 0.5) * 0.35 +
+                        (transScores[i] || 0.1) * 0.25
+                    );
+                    combined[i] = score;
+                }
+
+                const total = Object.values(combined).reduce((sum, v) => sum + v, 0);
+                if (total > 0) {
+                    for (const k in combined) {
+                        combined[k] /= total;
+                    }
+                }
+
+                return combined;
+            }
+
+            predict() {
+                if (this.numbers.length < 5) {
+                    const num = Math.floor(Math.random() * 10);
+                    return {
+                        number: num,
+                        big_small: getBigSmall(num),
+                        colors: getNumberColorClasses(num),
+                        confidence: 50,
+                        analysis: {
+                            method: 'Random Selection',
+                            reason: 'Insufficient data for statistical analysis. Need at least 5 periods.',
+                            top_candidates: []
+                        }
+                    };
+                }
+
+                const streakAnalysis = this.analyzeStreaks();
+                const alternatingAnalysis = this.analyzeAlternatingPattern();
+                const colorAnalysis = this.analyzeColorPatterns();
+                let numberProbs = this.calculateNumberProbabilities();
+
+                let predictedBigSmall = null;
+                let bigSmallConfidence = 0;
+                const analysisMethod = [];
+                let preferredColor = colorAnalysis.streak;
+
+                // 1. Big/Small Prediction
+                if (streakAnalysis.strength > 0.6) {
+                    predictedBigSmall = streakAnalysis.predicted;
+                    bigSmallConfidence = streakAnalysis.strength;
+                    analysisMethod.push(`Streak Reversal: Expected ${predictedBigSmall}`);
+                }
+
+                if (alternatingAnalysis.isAlternating && alternatingAnalysis.strength > bigSmallConfidence) {
+                    predictedBigSmall = alternatingAnalysis.next;
+                    bigSmallConfidence = alternatingAnalysis.strength;
+                    analysisMethod.push(`Alternating Pattern: Expected ${predictedBigSmall}`);
+                }
+
+                if (!predictedBigSmall) {
+                    const recentList = this.bigSmallList.slice(0, 20);
+                    const bigCount = recentList.filter(v => v === 'Big').length;
+                    const smallCount = recentList.filter(v => v === 'Small').length;
+
+                    if (bigCount > smallCount + 2) {
+                        predictedBigSmall = 'Small';
+                        bigSmallConfidence = 0.6;
+                        analysisMethod.push("Big/Small Imbalance: Expected Small");
+                    } else if (smallCount > bigCount + 2) {
+                        predictedBigSmall = 'Big';
+                        bigSmallConfidence = 0.6;
+                        analysisMethod.push("Big/Small Imbalance: Expected Big");
+                    } else {
+                        predictedBigSmall = bigCount >= smallCount ? 'Small' : 'Big'; // Predict reversal if balanced
+                        bigSmallConfidence = 0.55;
+                        analysisMethod.push("Statistical Balance Prediction");
+                    }
+                }
+
+                // 2. Number Probability Filtering (Filter by Big/Small)
+                let filteredProbs = {};
+                for (const k in numberProbs) {
+                    if (getBigSmall(parseInt(k)) === predictedBigSmall) {
+                        filteredProbs[k] = numberProbs[k];
+                    }
+                }
+
+                if (Object.keys(filteredProbs).length === 0) {
+                    filteredProbs = numberProbs;
+                }
+
+                // 3. Color Biasing
+                const greenNumbers = [1, 3, 5, 7, 9];
+                const redNumbers = [0, 2, 4, 6, 8];
+                const colorFreqs = colorAnalysis.frequencies;
+                const greenFreq = colorFreqs.Green || 0.5;
+                const redFreq = colorFreqs.Red || 0.5;
+
+                if (preferredColor) {
+                    const multiplier = 1.4;
+                    const antiMultiplier = 0.6;
+                    analysisMethod.push(`${preferredColor} Color Bias (Streak Reversal)`);
+
+                    for (const k in filteredProbs) {
+                        const num = parseInt(k);
+                        if (preferredColor === 'Green' && greenNumbers.includes(num)) {
+                            filteredProbs[k] *= multiplier;
+                        } else if (preferredColor === 'Red' && redNumbers.includes(num)) {
+                            filteredProbs[k] *= multiplier;
+                        } else {
+                            filteredProbs[k] *= antiMultiplier;
+                        }
+                    }
+                } else {
+                    // Bias towards the underrepresented color
+                    const colorBias = greenFreq - redFreq;
+                    if (Math.abs(colorBias) > 0.1) {
+                        for (const k in filteredProbs) {
+                            const num = parseInt(k);
+                            if (colorBias > 0 && redNumbers.includes(num)) { // Green is hot, favor Red
+                                filteredProbs[k] *= 1.15;
+                                analysisMethod.push("Red Color Bias (Green Overrepresented)");
+                            } else if (colorBias < 0 && greenNumbers.includes(num)) { // Red is hot, favor Green
+                                filteredProbs[k] *= 1.15;
+                                analysisMethod.push("Green Color Bias (Red Overrepresented)");
+                            }
+                        }
+                    }
+                }
 
 
-@app.route('/api/data')
-def get_data():
-    current = fetch_current_period()
-    history = fetch_history()
-    prediction = generate_prediction(history)
-    
-    return jsonify({
-        'next_period': current,
-        'history': history[:50],
-        'prediction': prediction
-    })
+                // 4. Final Normalization and Selection
+                const totalProb = Object.values(filteredProbs).reduce((sum, v) => sum + v, 0);
+                if (totalProb > 0) {
+                    for (const k in filteredProbs) {
+                        filteredProbs[k] /= totalProb;
+                    }
+                }
+
+                const sortedCandidates = Object.entries(filteredProbs)
+                    .map(([n, s]) => ({ number: parseInt(n), score: s }))
+                    .sort((a, b) => b.score - a.score);
+
+                const topCandidate = sortedCandidates[0] || { number: 0, score: 0 };
+                const topNumber = topCandidate.number;
+                const topProb = topCandidate.score;
+                const secondProb = sortedCandidates[1]?.score || 0;
+                const probGap = topProb - secondProb;
+
+                // Confidence calculation
+                const numberConfidence = Math.min(0.95, 0.5 + probGap * 3 + topProb * 0.2);
+                let overallConfidence = Math.floor((bigSmallConfidence * 0.4 + numberConfidence * 0.6) * 100);
+                overallConfidence = Math.max(55, Math.min(95, overallConfidence));
+
+                const predictedColors = getNumberColorClasses(topNumber);
+
+                return {
+                    number: topNumber,
+                    big_small: predictedBigSmall,
+                    colors: predictedColors,
+                    confidence: overallConfidence,
+                    analysis: {
+                        method: analysisMethod.join(' | ') || 'Complex Statistical Synthesis',
+                        reason: `Top Candidate (${topNumber}) probability: ${Math.round(topProb * 100)}%`,
+                        top_candidates: sortedCandidates.slice(0, 3).map(c => ({
+                            number: c.number,
+                            score: Math.round(c.score * 1000) / 10
+                        }))
+                    }
+                };
+            }
+        }
+
+        // --- UI RENDERING ---
+
+        let mainData = {
+            next_period: currentPeriodData,
+            history: historyCache.data,
+            prediction: null
+        };
+
+        function renderPrediction(prediction) {
+            if (!prediction) return;
+            mainData.prediction = prediction;
+
+            const numEl = document.getElementById('predicted-number');
+            const bsEl = document.getElementById('predicted-big-small');
+            const colorEl = document.getElementById('predicted-colors');
+            const confEl = document.getElementById('prediction-confidence');
+            const analysisEl = document.getElementById('analysis-reason');
+
+            // Number display
+            numEl.textContent = prediction.number;
+            numEl.className = 'text-6xl font-black mt-1 p-4 rounded-xl text-white shadow-2xl transition-transform duration-500 transform hover:scale-105';
+            prediction.colors.forEach(c => numEl.classList.add(`bg-${c}`));
+            if (prediction.colors.length > 1) numEl.classList.add('bg-gradient-to-r', 'from-primary-violet', 'to-primary-green'); // Handle Violet/Green/Red
+
+            // Big/Small
+            bsEl.textContent = prediction.big_small;
+            bsEl.style.color = prediction.big_small === 'Big' ? 'rgb(234 88 12)' : 'rgb(59 130 246)'; // Orange or Blue
+
+            // Colors
+            colorEl.innerHTML = '';
+            prediction.colors.forEach(c => {
+                const badge = document.createElement('span');
+                badge.textContent = c.replace('primary-', '');
+                badge.className = `px-2 py-0.5 text-xs font-semibold rounded-full text-white shadow-sm mr-1`;
+                badge.classList.add(`bg-${c}`);
+                colorEl.appendChild(badge);
+            });
+
+            // Confidence
+            confEl.textContent = `${prediction.confidence}% Confidence`;
+            if (prediction.confidence >= 75) {
+                confEl.classList.remove('bg-yellow-500', 'bg-red-500');
+                confEl.classList.add('bg-primary-green');
+            } else if (prediction.confidence >= 65) {
+                confEl.classList.remove('bg-primary-green', 'bg-red-500');
+                confEl.classList.add('bg-yellow-500');
+            } else {
+                confEl.classList.remove('bg-primary-green', 'bg-yellow-500');
+                confEl.classList.add('bg-red-500');
+            }
+
+            // Analysis
+            const candidateList = prediction.analysis.top_candidates.map(c => 
+                `<span class="font-bold">${c.number}</span> (${c.score}%)`
+            ).join(', ');
+            analysisEl.innerHTML = `Method: <span class="font-semibold">${prediction.analysis.method}</span>. Top Candidates: ${candidateList}.`;
+        }
+
+        function renderHistoryTable(history) {
+            const tbody = document.getElementById('history-table-body');
+            tbody.innerHTML = '';
+
+            history.slice(0, 20).forEach(item => {
+                const tr = document.createElement('tr');
+                tr.className = 'hover:bg-gray-50';
+
+                // Period
+                let tdPeriod = document.createElement('td');
+                tdPeriod.className = 'px-4 py-2 whitespace-nowrap text-sm font-medium text-gray-900';
+                tdPeriod.textContent = item.period;
+                tr.appendChild(tdPeriod);
+
+                // Result Number
+                let tdNumber = document.createElement('td');
+                tdNumber.className = 'px-4 py-2 whitespace-nowrap text-center';
+                const colorClasses = getNumberColorClasses(item.number);
+                tdNumber.innerHTML = `<span class="inline-flex items-center justify-center h-8 w-8 text-lg font-bold text-white rounded-full bg-${colorClasses[0]}" style="background-color: ${colorClasses.includes('primary-violet') ? 'linear-gradient(to right, #8b5cf6, #10b981)' : ''}">${item.number}</span>`;
+                tr.appendChild(tdNumber);
+
+                // Big/Small
+                let tdBS = document.createElement('td');
+                tdBS.className = 'px-4 py-2 whitespace-nowrap text-center text-sm font-medium';
+                tdBS.innerHTML = `<span class="text-sm font-semibold">${item.big_small}</span>`;
+                tdBS.style.color = item.big_small === 'Big' ? 'rgb(234 88 12)' : 'rgb(59 130 246)';
+                tr.appendChild(tdBS);
+
+                // Colors
+                let tdColors = document.createElement('td');
+                tdColors.className = 'px-4 py-2 whitespace-nowrap text-center text-sm';
+                tdColors.innerHTML = item.colors.map(c => {
+                    const colorClass = c === 'Green' ? 'bg-primary-green' : c === 'Red' ? 'bg-primary-red' : 'bg-primary-violet';
+                    return `<span class="px-2 py-0.5 text-xs font-medium rounded-full text-white shadow-sm mr-1 ${colorClass}">${c}</span>`;
+                }).join('');
+                tr.appendChild(tdColors);
+
+                tbody.appendChild(tr);
+            });
+        }
 
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+        function renderCurrentPeriod(data) {
+            document.getElementById('next-issue-number').textContent = `#${data.issueNumber}`;
+        }
+
+        // --- MAIN LOOP ---
+
+        let countdownInterval;
+        let dataRefreshInterval;
+
+        function updateCountdown() {
+            if (currentPeriodData.leftTime > 0) {
+                currentPeriodData.leftTime--;
+                const timerEl = document.getElementById('countdown-timer');
+                timerEl.textContent = String(currentPeriodData.leftTime).padStart(2, '0');
+                if (currentPeriodData.leftTime <= 5) {
+                    timerEl.classList.add('text-red-600', 'animate-pulse');
+                } else {
+                    timerEl.classList.remove('text-red-600', 'animate-pulse');
+                    timerEl.classList.add('text-gray-700');
+                }
+            } else {
+                // Time's up, force data refresh
+                clearInterval(countdownInterval);
+                document.getElementById('countdown-timer').textContent = '...';
+                document.getElementById('next-issue-number').textContent = 'Loading...';
+                fetchAndRenderAllData(true); // Force refresh
+                startCountdown(); // Restart the cycle
+            }
+        }
+
+        async function fetchAndRenderAllData(forceHistoryRefresh = false) {
+            document.getElementById('last-updated').textContent = 'Refreshing...';
+            try {
+                // 1. Fetch Current Period (Always fresh)
+                await fetchCurrentPeriod();
+                renderCurrentPeriod(currentPeriodData);
+                
+                // 2. Fetch History (Cached or refreshed)
+                const history = await fetchHistory(forceHistoryRefresh);
+                renderHistoryTable(history);
+
+                // 3. Generate Prediction
+                if (history.length > 0) {
+                    const engine = new PredictionEngine(history);
+                    const prediction = engine.predict();
+                    renderPrediction(prediction);
+                } else {
+                    renderPrediction(null);
+                }
+                
+                document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
+            } catch (error) {
+                console.error("Critical error in main data loop:", error);
+                document.getElementById('last-updated').textContent = 'Failed to load data';
+            }
+        }
+
+        function startCountdown() {
+            clearInterval(countdownInterval);
+            countdownInterval = setInterval(updateCountdown, UPDATE_INTERVAL);
+        }
+
+        function initialize() {
+            lucide.createIcons(); // Initialize Lucide Icons
+
+            // Initial fetch and render
+            fetchAndRenderAllData(true);
+
+            // Set up recurring data refresh (in case timer sync is off)
+            dataRefreshInterval = setInterval(() => fetchAndRenderAllData(false), DATA_REFRESH_INTERVAL);
+
+            // Start the countdown timer
+            startCountdown();
+        }
+
+        window.onload = initialize;
+    </script>
+</body>
+</html>
+
