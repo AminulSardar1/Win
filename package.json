@@ -1,0 +1,19 @@
+{
+  "name": "crypto-lottery-predictor-static",
+  "version": "1.0.0",
+  "description": "A single-file, client-side application for predicting WinGo 30S lottery results using pattern analysis.",
+  "main": "index.html",
+  "scripts": {
+    "start": "echo 'This is a static HTML file. Open index.html directly in your browser or use a local HTTP server (like VS Code Live Server) to run.'",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "serverless",
+    "static",
+    "html",
+    "javascript",
+    "vercel"
+  ],
+  "author": "",
+  "license": "ISC"
+}
